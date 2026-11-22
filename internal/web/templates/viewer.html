@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <title>{{.Artifact.Title}} · artifact.cubus.sh</title>
+  <link rel="stylesheet" href="/static/viewer.css">
+  <script src="/static/viewer.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <a class="brand" href="/">artifact.cubus.sh</a>
+      <span class="artifact-title">{{.Artifact.Title}}</span>
+      <span class="badge {{if eq .Artifact.Visibility "public"}}badge-public{{else}}badge-private{{end}}">{{.Artifact.Visibility}}</span>
+      <span class="badge">{{.MediaLabel}}</span>
+      <span class="muted">v{{.Artifact.Version}} · {{.SizeLabel}}</span>
+    </div>
+    <div class="topbar-right">
+      <button class="btn" type="button" data-copy-url="/v/{{.Artifact.ID}}">Copy link</button>
+      <a class="btn" href="/raw/{{.Artifact.ID}}?download=1">Download</a>
+      {{if or .IsHTML .IsPDF}}
+        <button class="btn" type="button" data-fullscreen-target="artifact-frame">Fullscreen</button>
+      {{end}}
+      {{if .User}}
+        <span class="muted">{{.User.Username}}</span>
+      {{else}}
+        <a class="btn" href="/login?next=/v/{{.Artifact.ID}}">Sign in</a>
+      {{end}}
+    </div>
+  </header>
+
+  <main class="viewer-body">
+    {{if .IsHTML}}
+      <iframe id="artifact-frame" class="viewer-frame" src="/raw/{{.Artifact.ID}}" sandbox="allow-scripts" referrerpolicy="no-referrer" title="{{.Artifact.Title}}"></iframe>
+    {{else if .IsPDF}}
+      <iframe id="artifact-frame" class="viewer-frame" src="/raw/{{.Artifact.ID}}" referrerpolicy="no-referrer" title="{{.Artifact.Title}}"></iframe>
+    {{else if .IsMarkdown}}
+      <article class="markdown-body">{{.RenderedMarkdown}}</article>
+    {{else}}
+      <div class="image-stage">
+        <img src="/raw/{{.Artifact.ID}}" alt="{{.Artifact.Title}}">
+      </div>
+    {{end}}
+  </main>
+</body>
+</html>

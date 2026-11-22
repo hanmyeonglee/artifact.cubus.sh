@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Not Found · artifact.cubus.sh</title>
+  <link rel="stylesheet" href="/static/viewer.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <a class="brand" href="/">artifact.cubus.sh</a>
+    </div>
+  </header>
+
+  <main class="container">
+    <div class="card card-narrow">
+      <h2>Not Found</h2>
+      <p class="muted">This artifact does not exist or is not accessible with your current session.</p>
+      <p>
+        {{if not .User}}
+          <a class="btn btn-primary" href="/login?next={{.Next}}">Sign in</a>
+        {{end}}
+        <a class="btn" href="/">Home</a>
+      </p>
+    </div>
+  </main>
+</body>
+</html>

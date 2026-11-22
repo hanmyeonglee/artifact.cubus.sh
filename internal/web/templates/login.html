@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Sign in · artifact.cubus.sh</title>
+  <link rel="stylesheet" href="/static/viewer.css">
+</head>
+<body>
+  <main class="container">
+    <div class="card card-narrow">
+      <h2>Sign in</h2>
+      {{if .Error}}<div class="alert">{{.Error}}</div>{{end}}
+      {{if .Notice}}<div class="alert alert-info">{{.Notice}}</div>{{end}}
+      <form method="post" action="/login">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <input type="hidden" name="next" value="{{.Next}}">
+        <div class="form-group">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" autocomplete="username" required value="{{.Username}}">
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="btn btn-primary" type="submit">Sign in</button>
+        {{if .AllowSignup}}
+          <a class="btn" href="/signup">Request account</a>
+        {{end}}
+      </form>
+    </div>
+  </main>
+</body>
+</html>

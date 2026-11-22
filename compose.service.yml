@@ -1,0 +1,23 @@
+services:
+  artifact:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    expose:
+      - "8000"
+      - "9090"
+    healthcheck:
+      test: ["CMD", "/artifact", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s

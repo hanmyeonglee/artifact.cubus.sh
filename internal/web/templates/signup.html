@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Request Account · artifact.cubus.sh</title>
+  <link rel="stylesheet" href="/static/viewer.css">
+</head>
+<body>
+  <main class="container">
+    <div class="card card-narrow">
+      <h2>Request Account</h2>
+      <p class="muted">New accounts require administrator approval before signing in.</p>
+      {{if .Error}}<div class="alert">{{.Error}}</div>{{end}}
+      {{if .Notice}}<div class="alert alert-info">{{.Notice}}</div>{{end}}
+      <form method="post" action="/signup">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <div class="form-group">
+          <label for="username">Username (3-64 chars: a-z, 0-9, ., _, -)</label>
+          <input id="username" name="username" type="text" autocomplete="username" required value="{{.Username}}">
+        </div>
+        <div class="form-group">
+          <label for="password">Password (12-128 bytes)</label>
+          <input id="password" name="password" type="password" autocomplete="new-password" required>
+        </div>
+        <button class="btn btn-primary" type="submit">Submit request</button>
+        <a class="btn" href="/login">Back to sign in</a>
+      </form>
+    </div>
+  </main>
+</body>
+</html>

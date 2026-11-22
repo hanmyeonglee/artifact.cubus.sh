@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+!.env.example
+*_test.go
+Dockerfile
+.dockerignore
+compose.service.yml
+docker-compose.yml
+README.md
