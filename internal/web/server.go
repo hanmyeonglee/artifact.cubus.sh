@@ -314,7 +314,7 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if userKey == "" {
 		userKey = "_"
 	}
-	if !s.loginIPLimit.Allow(ipKey) || !s.loginUserLimit.Allow(userKey) {
+	if !s.loginIPLimit.Allow(ipKey) || !s.loginUserLimit.Allow(ipKey+":"+userKey) {
 		w.Header().Set("Retry-After", "60")
 		renderErr(http.StatusTooManyRequests, "Too many sign-in attempts. Please wait a minute and try again.")
 		return
@@ -464,7 +464,7 @@ func (s *Server) handleSignupPost(w http.ResponseWriter, r *http.Request) {
 	if userKey == "" {
 		userKey = "_"
 	}
-	if !s.signupIPLimit.Allow(ipKey) || !s.signupUserLimit.Allow(userKey) {
+	if !s.signupIPLimit.Allow(ipKey) || !s.signupUserLimit.Allow(ipKey+":"+userKey) {
 		w.Header().Set("Retry-After", "60")
 		renderPage(http.StatusTooManyRequests, "Too many account requests. Please wait a minute.", "")
 		return
@@ -687,14 +687,19 @@ func (s *Server) handleUploadPut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if rawCT := strings.TrimSpace(r.Header.Get("Content-Type")); rawCT != "" {
-		if mt, _, parseErr := mime.ParseMediaType(rawCT); parseErr == nil {
-			mt = strings.ToLower(mt)
-			if mt != "application/octet-stream" && mt != "application/x-www-form-urlencoded" && mt != tok.ExpectedContentType {
-				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{
-					"error": fmt.Sprintf("expected Content-Type %s, got %s", tok.ExpectedContentType, mt),
-				})
-				return
-			}
+		mt, _, parseErr := mime.ParseMediaType(rawCT)
+		if parseErr != nil {
+			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{
+				"error": "malformed Content-Type header",
+			})
+			return
+		}
+		mt = strings.ToLower(mt)
+		if mt != "application/octet-stream" && mt != "application/x-www-form-urlencoded" && mt != tok.ExpectedContentType {
+			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{
+				"error": fmt.Sprintf("expected Content-Type %s, got %s", tok.ExpectedContentType, mt),
+			})
+			return
 		}
 	}
 
@@ -705,9 +710,18 @@ func (s *Server) handleUploadPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Extend deadlines for large (up to 50 MiB) binary uploads.
+	rc := http.NewResponseController(w)
+	deadline := time.Now().Add(5 * time.Minute)
+	_ = rc.SetReadDeadline(deadline)
+	_ = rc.SetWriteDeadline(deadline)
+
 	r.Body = http.MaxBytesReader(w, r.Body, tok.MaxBytes)
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
+	var buf bytes.Buffer
+	if r.ContentLength > 0 && r.ContentLength <= tok.MaxBytes {
+		buf.Grow(int(r.ContentLength))
+	}
+	if _, err := io.Copy(&buf, r.Body); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
@@ -718,6 +732,7 @@ func (s *Server) handleUploadPut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read upload body"})
 		return
 	}
+	data := buf.Bytes()
 
 	if err := artifact.ValidatePayload(tok.ExpectedContentType, data); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -797,7 +812,7 @@ func (s *Server) handleViewer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if art.Visibility == artifact.VisibilityPrivate {
+	if art.Visibility == artifact.VisibilityPrivate || userPtr != nil {
 		w.Header().Set("Cache-Control", "private, no-store")
 	} else {
 		w.Header().Set("Cache-Control", "no-cache")

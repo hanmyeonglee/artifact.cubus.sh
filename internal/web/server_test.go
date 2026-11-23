@@ -686,3 +686,75 @@ func TestLoginCSRFAndPendingSignupGate(t *testing.T) {
 		t.Fatalf("expected 401 for pending user login, got %d", lPostResp.StatusCode)
 	}
 }
+
+func TestCreateUploadDefersVisibilityMutationUntilComplete(t *testing.T) {
+	env := newTestEnv(t)
+	aliceToken := env.obtainOAuthAccessToken(t, "alice", "alice-strong-password-123", []string{auth.ScopeRead, auth.ScopeWrite})
+	aliceMCP := env.connectMCP(t, aliceToken)
+
+	// Publish a PRIVATE artifact first.
+	res, privArt := callToolJSON[mcpserver.ArtifactView](t, aliceMCP, "publish_artifact", map[string]any{
+		"title":        "Secret Draft",
+		"content_type": "text/html",
+		"visibility":   "private",
+		"content":      "<h1>TOP SECRET</h1>",
+	})
+	if res.IsError {
+		t.Fatalf("publish failed: %+v", res.Content)
+	}
+
+	// Request replacement upload with visibility="public" and new title.
+	res, ticket := callToolJSON[mcpserver.CreateUploadOutput](t, aliceMCP, "create_upload", map[string]any{
+		"artifact_id":  privArt.ID,
+		"title":        "Public Release",
+		"content_type": "text/html",
+		"visibility":   "public",
+	})
+	if res.IsError || ticket.UploadURL == "" {
+		t.Fatalf("create_upload failed: %+v", res.Content)
+	}
+
+	// BEFORE PUT finishes, anonymous caller MUST still get 404 (old private payload not exposed!).
+	preResp, err := http.Get(env.baseURL + "/raw/" + privArt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preResp.Body.Close()
+	if preResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("private artifact was prematurely exposed before upload completion: status=%d", preResp.StatusCode)
+	}
+
+	// Malformed Content-Type on PUT returns 415 Unsupported Media Type.
+	badReq, _ := http.NewRequest(http.MethodPut, ticket.UploadURL, strings.NewReader("<h1>ok</h1>"))
+	badReq.Header.Set("Content-Type", "text/html; =invalid")
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badResp.Body.Close()
+	if badResp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415 for malformed Content-Type, got %d", badResp.StatusCode)
+	}
+
+	// Valid PUT atomically swaps payload, title, visibility -> public, and increments version.
+	putReq, _ := http.NewRequest(http.MethodPut, ticket.UploadURL, strings.NewReader("<h1>PUBLIC V2</h1>"))
+	putReq.Header.Set("Content-Type", "text/html")
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on valid PUT, got %d", putResp.StatusCode)
+	}
+
+	postResp, err := http.Get(env.baseURL + "/raw/" + privArt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postBody, _ := io.ReadAll(postResp.Body)
+	postResp.Body.Close()
+	if postResp.StatusCode != http.StatusOK || !strings.Contains(string(postBody), "PUBLIC V2") {
+		t.Fatalf("expected public v2 body after upload, got %d %q", postResp.StatusCode, string(postBody))
+	}
+}

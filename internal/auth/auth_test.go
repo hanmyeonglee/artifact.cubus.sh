@@ -358,4 +358,50 @@ func TestOAuth21FullLifecycleAndSecurityInvariants(t *testing.T) {
 	if _, err := oauth.TokenVerifier()(ctx, rawActive, nil); err == nil {
 		t.Fatal("expected revoked token to fail verification")
 	}
+
+	// 8. Redirect URI validation rejects trailing empty '#' and invalid ports;
+	//    DCR client registered without refresh_token receives no refresh_token.
+	for _, badURI := range []string{"https://client.example/cb#", "http://127.0.0.1:99999/cb", "http://127.0.0.1:/cb"} {
+		if err := ValidateRedirectURI(badURI); err == nil {
+			t.Fatalf("expected ValidateRedirectURI to reject %q", badURI)
+		}
+	}
+	if !MatchRegisteredRedirectURI([]string{"http://127.0.0.1"}, "http://127.0.0.1:54321/") {
+		t.Fatal("expected empty path loopback redirect to match root '/'")
+	}
+	noRefDCR := httptest.NewRequest(http.MethodPost, "/oauth/register", bytes.NewBufferString(`{
+		"client_name": "AuthCodeOnly",
+		"redirect_uris": ["http://127.0.0.1/cb"],
+		"grant_types": ["authorization_code"]
+	}`))
+	noRefDCR.RemoteAddr = "127.0.0.1:9001"
+	noRefRec := httptest.NewRecorder()
+	oauth.HandleRegister(noRefRec, noRefDCR)
+	if noRefRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for auth-code-only DCR, got %d", noRefRec.Code)
+	}
+	var noRefReg struct {
+		ClientID string `json:"client_id"`
+	}
+	_ = json.Unmarshal(noRefRec.Body.Bytes(), &noRefReg)
+	v3, c3 := makePKCEPair(t)
+	ar3, err := oauth.ValidateAuthorizeParams(reqObj, url.Values{
+		"client_id": {noRefReg.ClientID}, "redirect_uri": {"http://127.0.0.1:45678/cb"},
+		"response_type": {"code"}, "code_challenge": {c3}, "code_challenge_method": {"S256"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r3, err := oauth.IssueAuthorizationCode(reqObj, ar3, user.ID, []string{ScopeRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u3, _ := url.Parse(r3)
+	t3Rec := tokenCall(url.Values{
+		"grant_type": {"authorization_code"}, "client_id": {noRefReg.ClientID},
+		"code": {u3.Query().Get("code")}, "redirect_uri": {"http://127.0.0.1:45678/cb"}, "code_verifier": {v3},
+	})
+	if t3Rec.Code != http.StatusOK || strings.Contains(t3Rec.Body.String(), "refresh_token") {
+		t.Fatalf("expected 200 without refresh_token for auth_code-only client, got %d %s", t3Rec.Code, t3Rec.Body.String())
+	}
 }

@@ -77,7 +77,7 @@ func (h *PasswordHasher) Verify(ctx context.Context, password, encodedHash strin
 
 // VerifyDummy runs identical Argon2id work for unknown/inactive users to prevent username timing oracles.
 func (h *PasswordHasher) VerifyDummy(ctx context.Context, password string) error {
-	if len(password) > MaxPasswordBytes {
+	if len(password) == 0 || len(password) > MaxPasswordBytes {
 		return nil
 	}
 	if err := h.acquire(ctx); err != nil {
@@ -150,6 +150,9 @@ func verifyArgon2idRaw(password, encoded string) (bool, error) {
 		case "t":
 			iterations = uint32(n)
 		case "p":
+			if n > 255 {
+				return false, errors.New("invalid argon2id parallelism")
+			}
 			parallelism = uint8(n)
 		}
 	}

@@ -18,30 +18,32 @@ import (
 // MemoryStore is a concurrency-safe in-memory Store implementation mirroring
 // PGStore's atomic transaction semantics for comprehensive -race unit tests.
 type MemoryStore struct {
-	mu           sync.Mutex
-	users        map[string]User
-	settings     AppSettings
-	sessions     map[string]WebSession
-	clients      map[string]OAuthClient
-	authCodes    map[string]OAuthAuthCode
-	tokens       map[string]OAuthToken
-	artifacts    map[string]Artifact
-	blobs        map[string][]byte
-	uploadTokens map[string]UploadToken
-	pingErr      error
+	mu               sync.Mutex
+	users            map[string]User
+	settings         AppSettings
+	sessions         map[string]WebSession
+	clients          map[string]OAuthClient
+	authCodes        map[string]OAuthAuthCode
+	replayedFamilies map[string]bool
+	tokens           map[string]OAuthToken
+	artifacts        map[string]Artifact
+	blobs            map[string][]byte
+	uploadTokens     map[string]UploadToken
+	pingErr          error
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		users:        make(map[string]User),
-		settings:     DefaultAppSettings(),
-		sessions:     make(map[string]WebSession),
-		clients:      make(map[string]OAuthClient),
-		authCodes:    make(map[string]OAuthAuthCode),
-		tokens:       make(map[string]OAuthToken),
-		artifacts:    make(map[string]Artifact),
-		blobs:        make(map[string][]byte),
-		uploadTokens: make(map[string]UploadToken),
+		users:            make(map[string]User),
+		settings:         DefaultAppSettings(),
+		sessions:         make(map[string]WebSession),
+		clients:          make(map[string]OAuthClient),
+		authCodes:        make(map[string]OAuthAuthCode),
+		replayedFamilies: make(map[string]bool),
+		tokens:           make(map[string]OAuthToken),
+		artifacts:        make(map[string]Artifact),
+		blobs:            make(map[string][]byte),
+		uploadTokens:     make(map[string]UploadToken),
 	}
 }
 
@@ -321,6 +323,7 @@ func (m *MemoryStore) ConsumeOAuthAuthCode(_ context.Context, codeHash []byte) (
 	}
 	now := time.Now().UTC()
 	if code.UsedAt != nil {
+		m.replayedFamilies[code.FamilyID] = true
 		for tk, t := range m.tokens {
 			if t.FamilyID == code.FamilyID && t.RevokedAt == nil {
 				t.RevokedAt = &now
@@ -340,6 +343,9 @@ func (m *MemoryStore) ConsumeOAuthAuthCode(_ context.Context, codeHash []byte) (
 func (m *MemoryStore) CreateOAuthToken(_ context.Context, tok OAuthToken) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.replayedFamilies[tok.FamilyID] {
+		return ErrCodeReplayed
+	}
 	tok.ID = uuid.NewString()
 	tok.CreatedAt = time.Now().UTC()
 	m.tokens[tok.ID] = tok
@@ -667,6 +673,8 @@ func (m *MemoryStore) CreateUploadTicket(_ context.Context, ownerID, targetID, n
 	defer m.mu.Unlock()
 	now := time.Now().UTC()
 	var art Artifact
+	var pendingTitle *string
+	var pendingVisibility *string
 	if targetID == "" {
 		if err := m.ownerQuotaLocked(ownerID, 0, 1, 1<<62, maxCount); err != nil {
 			return Artifact{}, err
@@ -689,13 +697,13 @@ func (m *MemoryStore) CreateUploadTicket(_ context.Context, ownerID, targetID, n
 			return Artifact{}, ErrNotFound
 		}
 		if title != "" {
-			cur.Title = title
+			t := title
+			pendingTitle = &t
 		}
 		if visibility != "" {
-			cur.Visibility = visibility
+			v := visibility
+			pendingVisibility = &v
 		}
-		cur.UpdatedAt = now
-		m.artifacts[cur.ID] = cur
 		art = cur
 	}
 	m.uploadTokens[hex.EncodeToString(tokenHash)] = UploadToken{
@@ -703,6 +711,8 @@ func (m *MemoryStore) CreateUploadTicket(_ context.Context, ownerID, targetID, n
 		ArtifactID:          art.ID,
 		OwnerID:             ownerID,
 		ExpectedContentType: contentType,
+		PendingTitle:        pendingTitle,
+		PendingVisibility:   pendingVisibility,
 		MaxBytes:            maxBytes,
 		ExpiresAt:           expiresAt,
 	}
@@ -751,6 +761,12 @@ func (m *MemoryStore) CompleteUpload(_ context.Context, tokenHash []byte, data [
 
 	if cur.Status == artifact.StatusReady {
 		cur.Version++
+	}
+	if tok.PendingTitle != nil {
+		cur.Title = *tok.PendingTitle
+	}
+	if tok.PendingVisibility != nil {
+		cur.Visibility = *tok.PendingVisibility
 	}
 	cur.ContentType = tok.ExpectedContentType
 	cur.SizeBytes = int64(len(data))

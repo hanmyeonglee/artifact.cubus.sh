@@ -6,9 +6,10 @@
       const fullUrl = target.startsWith("http") ? target : new URL(target, window.location.origin).toString();
       try {
         await navigator.clipboard.writeText(fullUrl);
-        const orig = copyBtn.textContent;
+        if (!copyBtn.dataset.origLabel) copyBtn.dataset.origLabel = copyBtn.textContent;
         copyBtn.textContent = "Copied";
-        setTimeout(() => { copyBtn.textContent = orig; }, 1500);
+        clearTimeout(copyBtn._copyTimer);
+        copyBtn._copyTimer = setTimeout(() => { copyBtn.textContent = copyBtn.dataset.origLabel; }, 1500);
       } catch {
         window.prompt("Copy link:", fullUrl);
       }

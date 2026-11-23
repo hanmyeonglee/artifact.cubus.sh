@@ -244,6 +244,10 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusBadRequest, "invalid settings patch JSON")
 		return
 	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeAdminError(w, http.StatusBadRequest, "trailing JSON tokens in settings patch")
+		return
+	}
 
 	if patch.MaxUploadMB != nil && (*patch.MaxUploadMB < minUploadMB || *patch.MaxUploadMB > maxUploadMB) {
 		writeAdminError(w, http.StatusBadRequest, fmt.Sprintf("max_upload_mb must be between %d and %d", minUploadMB, maxUploadMB))

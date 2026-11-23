@@ -25,6 +25,7 @@ type migration struct {
 
 var allMigrations = []migration{
 	{version: 1, file: "migrations/001_init.sql"},
+	{version: 2, file: "migrations/002_hardening.sql"},
 }
 
 // Migrate applies embedded SQL migrations inside transaction-scoped advisory

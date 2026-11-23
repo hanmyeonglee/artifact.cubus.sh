@@ -185,6 +185,8 @@ type UploadToken struct {
 	ArtifactID          string
 	OwnerID             string
 	ExpectedContentType string
+	PendingTitle        *string
+	PendingVisibility   *string
 	MaxBytes            int64
 	ExpiresAt           time.Time
 	UsedAt              *time.Time
@@ -280,15 +282,24 @@ func (s *PGStore) GetUserByUsername(ctx context.Context, username string) (User,
 	return u, err
 }
 
+func parseCanonicalUUID(raw string) (string, bool) {
+	u, err := uuid.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", false
+	}
+	return u.String(), true
+}
+
 func (s *PGStore) GetUserByID(ctx context.Context, id string) (User, error) {
-	if _, err := uuid.Parse(id); err != nil {
+	canonID, ok := parseCanonicalUUID(id)
+	if !ok {
 		return User{}, ErrNotFound
 	}
 	var u User
 	err := s.pool.QueryRow(ctx, `
 		SELECT id::text, username, password_hash, role, status, created_at, updated_at
 		FROM users WHERE id = $1::uuid
-	`, id).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	`, canonID).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
@@ -354,7 +365,8 @@ func (s *PGStore) ListUsersWithCounts(ctx context.Context, statusFilter string) 
 }
 
 func (s *PGStore) ApproveUser(ctx context.Context, id string) (User, error) {
-	if _, err := uuid.Parse(id); err != nil {
+	canonID, ok := parseCanonicalUUID(id)
+	if !ok {
 		return User{}, ErrNotFound
 	}
 	var u User
@@ -362,7 +374,7 @@ func (s *PGStore) ApproveUser(ctx context.Context, id string) (User, error) {
 		UPDATE users SET status = 'active', updated_at = now()
 		WHERE id = $1::uuid
 		RETURNING id::text, username, password_hash, role, status, created_at, updated_at
-	`, id).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	`, canonID).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
@@ -370,7 +382,8 @@ func (s *PGStore) ApproveUser(ctx context.Context, id string) (User, error) {
 }
 
 func (s *PGStore) DenyUser(ctx context.Context, id string) (User, error) {
-	if _, err := uuid.Parse(id); err != nil {
+	canonID, ok := parseCanonicalUUID(id)
+	if !ok {
 		return User{}, ErrNotFound
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -387,7 +400,7 @@ func (s *PGStore) DenyUser(ctx context.Context, id string) (User, error) {
 	err = tx.QueryRow(ctx, `
 		SELECT id::text, username, password_hash, role, status, created_at, updated_at
 		FROM users WHERE id = $1::uuid FOR UPDATE
-	`, id).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	`, canonID).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}
@@ -409,18 +422,21 @@ func (s *PGStore) DenyUser(ctx context.Context, id string) (User, error) {
 		UPDATE users SET status = 'denied', updated_at = now()
 		WHERE id = $1::uuid
 		RETURNING id::text, username, password_hash, role, status, created_at, updated_at
-	`, id).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	`, canonID).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return User{}, err
 	}
 
-	if _, err := tx.Exec(ctx, `DELETE FROM web_sessions WHERE user_id = $1::uuid`, id); err != nil {
+	if _, err := tx.Exec(ctx, `DELETE FROM web_sessions WHERE user_id = $1::uuid`, canonID); err != nil {
 		return User{}, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE oauth_tokens SET revoked_at = now() WHERE user_id = $1::uuid AND revoked_at IS NULL`, id); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE oauth_tokens SET revoked_at = now() WHERE user_id = $1::uuid AND revoked_at IS NULL`, canonID); err != nil {
 		return User{}, err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM upload_tokens WHERE owner_id = $1::uuid AND used_at IS NULL`, id); err != nil {
+	if _, err := tx.Exec(ctx, `DELETE FROM oauth_authorization_codes WHERE user_id = $1::uuid AND used_at IS NULL`, canonID); err != nil {
+		return User{}, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM upload_tokens WHERE owner_id = $1::uuid AND used_at IS NULL`, canonID); err != nil {
 		return User{}, err
 	}
 
@@ -594,11 +610,15 @@ func (s *PGStore) ConsumeOAuthAuthCode(ctx context.Context, codeHash []byte) (OA
 		return OAuthAuthCode{}, err
 	}
 
-	// Check if already used -> revoke all tokens issued under this code's family (RFC 6749 §4.1.2).
+	// Check if already used -> mark family compromised persistently and revoke tokens (RFC 6749 §4.1.2).
 	var familyID string
-	var usedAt *time.Time
-	err2 := tx.QueryRow(ctx, `SELECT family_id::text, used_at FROM oauth_authorization_codes WHERE code_hash = $1`, codeHash).Scan(&familyID, &usedAt)
-	if err2 == nil && usedAt != nil {
+	err2 := tx.QueryRow(ctx, `
+		UPDATE oauth_authorization_codes
+		SET replayed_at = COALESCE(replayed_at, now())
+		WHERE code_hash = $1 AND used_at IS NOT NULL
+		RETURNING family_id::text
+	`, codeHash).Scan(&familyID)
+	if err2 == nil {
 		if _, rerr := tx.Exec(ctx, `UPDATE oauth_tokens SET revoked_at = now() WHERE family_id = $1::uuid AND revoked_at IS NULL`, familyID); rerr != nil {
 			return OAuthAuthCode{}, rerr
 		}
@@ -611,11 +631,35 @@ func (s *PGStore) ConsumeOAuthAuthCode(ctx context.Context, codeHash []byte) (OA
 }
 
 func (s *PGStore) CreateOAuthToken(ctx context.Context, tok OAuthToken) error {
-	_, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Lock any matching auth code row in the same order as replay detection (oauth_authorization_codes -> oauth_tokens)
+	// so a concurrent code replay cannot miss revoking this newly minted token.
+	var replayedAt *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT replayed_at
+		FROM oauth_authorization_codes
+		WHERE family_id = $1::uuid
+		FOR UPDATE
+	`, tok.FamilyID).Scan(&replayedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if replayedAt != nil {
+		return ErrCodeReplayed
+	}
+
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO oauth_tokens (family_id, token_hash, refresh_token_hash, client_id, user_id, scope, resource, access_expires_at, refresh_expires_at)
 		VALUES ($1::uuid, $2, $3, $4, $5::uuid, $6, $7, $8, $9)
-	`, tok.FamilyID, tok.TokenHash, tok.RefreshTokenHash, tok.ClientID, tok.UserID, tok.Scope, tok.Resource, tok.AccessExpiresAt, tok.RefreshExpiresAt)
-	return err
+	`, tok.FamilyID, tok.TokenHash, tok.RefreshTokenHash, tok.ClientID, tok.UserID, tok.Scope, tok.Resource, tok.AccessExpiresAt, tok.RefreshExpiresAt); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *PGStore) GetActiveAccessToken(ctx context.Context, tokenHash []byte) (OAuthToken, User, error) {
@@ -921,8 +965,8 @@ func (s *PGStore) ListAllArtifactsAdmin(ctx context.Context, f AdminArtifactList
 	args := make([]any, 0, 6)
 	conds := []string{"a.status = 'ready'"}
 	if owner := strings.TrimSpace(f.Owner); owner != "" {
-		if _, err := uuid.Parse(owner); err == nil {
-			args = append(args, owner)
+		if canonID, ok := parseCanonicalUUID(owner); ok {
+			args = append(args, canonID)
 			conds = append(conds, fmt.Sprintf("a.owner_id = $%d::uuid", len(args)))
 		} else {
 			args = append(args, strings.ToLower(owner))
@@ -1013,6 +1057,8 @@ func (s *PGStore) CreateUploadTicket(ctx context.Context, ownerID, targetID, new
 	defer tx.Rollback(ctx)
 
 	var art Artifact
+	var pendingTitle *string
+	var pendingVisibility *string
 	if targetID == "" {
 		if err := checkOwnerQuotaPG(ctx, tx, ownerID, 0, 1, 1<<62, maxCount); err != nil {
 			return Artifact{}, err
@@ -1029,7 +1075,8 @@ func (s *PGStore) CreateUploadTicket(ctx context.Context, ownerID, targetID, new
 			return Artifact{}, err
 		}
 	} else {
-		// Updating an existing owned artifact keeps its live 'ready' status intact until upload finishes.
+		// Updating an existing owned artifact keeps BOTH its live payload AND live title/visibility
+		// completely untouched until PUT /upload/{token} succeeds atomically in CompleteUpload.
 		err = tx.QueryRow(ctx, `
 			SELECT id, owner_id::text, title, content_type, visibility, version, size_bytes, sha256, status, created_at, updated_at
 			FROM artifacts WHERE id = $1 AND owner_id = $2::uuid FOR UPDATE
@@ -1044,20 +1091,19 @@ func (s *PGStore) CreateUploadTicket(ctx context.Context, ownerID, targetID, new
 			return Artifact{}, err
 		}
 		if title != "" {
-			art.Title = title
+			t := title
+			pendingTitle = &t
 		}
 		if visibility != "" {
-			art.Visibility = visibility
-		}
-		if _, err := tx.Exec(ctx, `UPDATE artifacts SET title = $1, visibility = $2, updated_at = now() WHERE id = $3`, art.Title, art.Visibility, art.ID); err != nil {
-			return Artifact{}, err
+			v := visibility
+			pendingVisibility = &v
 		}
 	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO upload_tokens (token_hash, artifact_id, owner_id, expected_content_type, max_bytes, expires_at)
-		VALUES ($1, $2, $3::uuid, $4, $5, $6)
-	`, tokenHash, art.ID, ownerID, contentType, maxBytes, expiresAt); err != nil {
+		INSERT INTO upload_tokens (token_hash, artifact_id, owner_id, expected_content_type, pending_title, pending_visibility, max_bytes, expires_at)
+		VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8)
+	`, tokenHash, art.ID, ownerID, contentType, pendingTitle, pendingVisibility, maxBytes, expiresAt); err != nil {
 		return Artifact{}, err
 	}
 
@@ -1067,11 +1113,11 @@ func (s *PGStore) CreateUploadTicket(ctx context.Context, ownerID, targetID, new
 func (s *PGStore) PeekUploadToken(ctx context.Context, tokenHash []byte) (UploadToken, error) {
 	var tok UploadToken
 	err := s.pool.QueryRow(ctx, `
-		SELECT ut.token_hash, ut.artifact_id, ut.owner_id::text, ut.expected_content_type, ut.max_bytes, ut.expires_at, ut.used_at
+		SELECT ut.token_hash, ut.artifact_id, ut.owner_id::text, ut.expected_content_type, ut.pending_title, ut.pending_visibility, ut.max_bytes, ut.expires_at, ut.used_at
 		FROM upload_tokens ut
 		JOIN users u ON u.id = ut.owner_id
 		WHERE ut.token_hash = $1 AND ut.used_at IS NULL AND ut.expires_at > now() AND u.status = 'active'
-	`, tokenHash).Scan(&tok.TokenHash, &tok.ArtifactID, &tok.OwnerID, &tok.ExpectedContentType, &tok.MaxBytes, &tok.ExpiresAt, &tok.UsedAt)
+	`, tokenHash).Scan(&tok.TokenHash, &tok.ArtifactID, &tok.OwnerID, &tok.ExpectedContentType, &tok.PendingTitle, &tok.PendingVisibility, &tok.MaxBytes, &tok.ExpiresAt, &tok.UsedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return UploadToken{}, ErrUploadTokenInvalid
 	}
@@ -1085,13 +1131,46 @@ func (s *PGStore) CompleteUpload(ctx context.Context, tokenHash []byte, data []b
 	}
 	defer tx.Rollback(ctx)
 
+	// 1. Plain SELECT (no row lock) to discover artifact_id + owner_id.
+	//    Locking artifacts BEFORE upload_tokens matches DELETE FROM artifacts (ON DELETE CASCADE)
+	//    and prevents PostgreSQL 40P01 deadlocks.
+	var artifactID, ownerID string
+	err = tx.QueryRow(ctx, `
+		SELECT artifact_id, owner_id::text
+		FROM upload_tokens
+		WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
+	`, tokenHash).Scan(&artifactID, &ownerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Artifact{}, ErrUploadTokenInvalid
+	}
+	if err != nil {
+		return Artifact{}, err
+	}
+
+	// 2. Lock parent artifact row first.
+	var cur Artifact
+	err = tx.QueryRow(ctx, `
+		SELECT id, owner_id::text, title, content_type, visibility, version, size_bytes, sha256, status, created_at, updated_at
+		FROM artifacts WHERE id = $1 AND owner_id = $2::uuid FOR UPDATE
+	`, artifactID, ownerID).Scan(
+		&cur.ID, &cur.OwnerID, &cur.Title, &cur.ContentType, &cur.Visibility,
+		&cur.Version, &cur.SizeBytes, &cur.SHA256, &cur.Status, &cur.CreatedAt, &cur.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Artifact{}, ErrNotFound
+	}
+	if err != nil {
+		return Artifact{}, err
+	}
+
+	// 3. Atomically claim the single-use upload token second.
 	var tok UploadToken
 	err = tx.QueryRow(ctx, `
 		UPDATE upload_tokens
 		SET used_at = now()
 		WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
-		RETURNING token_hash, artifact_id, owner_id::text, expected_content_type, max_bytes, expires_at, used_at
-	`, tokenHash).Scan(&tok.TokenHash, &tok.ArtifactID, &tok.OwnerID, &tok.ExpectedContentType, &tok.MaxBytes, &tok.ExpiresAt, &tok.UsedAt)
+		RETURNING token_hash, artifact_id, owner_id::text, expected_content_type, pending_title, pending_visibility, max_bytes, expires_at, used_at
+	`, tokenHash).Scan(&tok.TokenHash, &tok.ArtifactID, &tok.OwnerID, &tok.ExpectedContentType, &tok.PendingTitle, &tok.PendingVisibility, &tok.MaxBytes, &tok.ExpiresAt, &tok.UsedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Artifact{}, ErrUploadTokenInvalid
 	}
@@ -1107,21 +1186,6 @@ func (s *PGStore) CompleteUpload(ctx context.Context, tokenHash []byte, data []b
 		return Artifact{}, ErrUserInactive
 	}
 
-	var cur Artifact
-	err = tx.QueryRow(ctx, `
-		SELECT id, owner_id::text, title, content_type, visibility, version, size_bytes, sha256, status, created_at, updated_at
-		FROM artifacts WHERE id = $1 AND owner_id = $2::uuid FOR UPDATE
-	`, tok.ArtifactID, tok.OwnerID).Scan(
-		&cur.ID, &cur.OwnerID, &cur.Title, &cur.ContentType, &cur.Visibility,
-		&cur.Version, &cur.SizeBytes, &cur.SHA256, &cur.Status, &cur.CreatedAt, &cur.UpdatedAt,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Artifact{}, ErrNotFound
-	}
-	if err != nil {
-		return Artifact{}, err
-	}
-
 	delta := int64(len(data)) - cur.SizeBytes
 	if err := checkOwnerQuotaPG(ctx, tx, tok.OwnerID, delta, 0, maxStorageBytes, artifact.MaxArtifactsPerUser+1); err != nil {
 		return Artifact{}, err
@@ -1133,15 +1197,17 @@ func (s *PGStore) CompleteUpload(ctx context.Context, tokenHash []byte, data []b
 
 	err = tx.QueryRow(ctx, `
 		UPDATE artifacts
-		SET content_type = $1,
-		    size_bytes = $2,
-		    sha256 = $3,
+		SET title = COALESCE($1, title),
+		    visibility = COALESCE($2, visibility),
+		    content_type = $3,
+		    size_bytes = $4,
+		    sha256 = $5,
 		    version = CASE WHEN status = 'ready' THEN version + 1 ELSE version END,
 		    status = 'ready',
 		    updated_at = now()
-		WHERE id = $4
+		WHERE id = $6
 		RETURNING id, owner_id::text, title, content_type, visibility, version, size_bytes, sha256, status, created_at, updated_at
-	`, tok.ExpectedContentType, int64(len(data)), sha256Hex, cur.ID).Scan(
+	`, tok.PendingTitle, tok.PendingVisibility, tok.ExpectedContentType, int64(len(data)), sha256Hex, cur.ID).Scan(
 		&cur.ID, &cur.OwnerID, &cur.Title, &cur.ContentType, &cur.Visibility,
 		&cur.Version, &cur.SizeBytes, &cur.SHA256, &cur.Status, &cur.CreatedAt, &cur.UpdatedAt,
 	)

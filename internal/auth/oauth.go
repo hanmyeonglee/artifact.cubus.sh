@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -74,7 +75,7 @@ func CORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, MCP-Protocol-Version, Mcp-Session-Id")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name, Last-Event-ID")
 		w.Header().Set("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -139,6 +140,11 @@ func (o *OAuthServer) HandleRegister(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxOAuthBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeOAuthError(w, http.StatusRequestEntityTooLarge, "invalid_client_metadata", "request body too large")
+			return
+		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "invalid request body")
 		return
 	}
@@ -437,25 +443,37 @@ func (o *OAuthServer) handleAuthorizationCodeGrant(w http.ResponseWriter, r *htt
 		return
 	}
 
-	accessTok, refreshTok, err := o.mintTokenPair(r, codeRec.FamilyID, client.ClientID, u.ID, codeRec.Scope, codeRec.Resource)
+	allowRefresh := slices.Contains(client.GrantTypes, "refresh_token")
+	accessTok, refreshTok, err := o.mintTokenPair(r, codeRec.FamilyID, client.ClientID, u.ID, codeRec.Scope, codeRec.Resource, allowRefresh)
+	if errors.Is(err, store.ErrCodeReplayed) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code replay detected")
+		return
+	}
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue tokens")
 		return
 	}
 	_ = o.store.TouchOAuthClient(r.Context(), client.ClientID)
 
-	writeOAuthJSON(w, http.StatusOK, map[string]any{
-		"access_token":  accessTok,
-		"token_type":    "Bearer",
-		"expires_in":    int(AccessTokenTTL.Seconds()),
-		"refresh_token": refreshTok,
-		"scope":         codeRec.Scope,
-	})
+	resp := map[string]any{
+		"access_token": accessTok,
+		"token_type":   "Bearer",
+		"expires_in":   int(AccessTokenTTL.Seconds()),
+		"scope":        codeRec.Scope,
+	}
+	if refreshTok != "" {
+		resp["refresh_token"] = refreshTok
+	}
+	writeOAuthJSON(w, http.StatusOK, resp)
 }
 
 func (o *OAuthServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 	client, ok := o.authenticateClient(w, r)
 	if !ok {
+		return
+	}
+	if !slices.Contains(client.GrantTypes, "refresh_token") {
+		writeOAuthError(w, http.StatusBadRequest, "unauthorized_client", "client is not registered for refresh_token grant")
 		return
 	}
 
@@ -535,6 +553,8 @@ func (o *OAuthServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Req
 }
 
 func (o *OAuthServer) HandleRevoke(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	if r.Method != http.MethodPost {
 		writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
 		return
@@ -590,6 +610,10 @@ func (o *OAuthServer) authenticateClient(w http.ResponseWriter, r *http.Request)
 	usedBasic := false
 
 	if authz := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(authz), "basic ") {
+		if r.PostForm.Get("client_secret") != "" {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "multiple client authentication methods used")
+			return store.OAuthClient{}, false
+		}
 		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(authz[6:]))
 		if err != nil {
 			writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "invalid basic authorization header")
@@ -646,27 +670,34 @@ func (o *OAuthServer) authenticateClient(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-func (o *OAuthServer) mintTokenPair(r *http.Request, familyID, clientID, userID, scope, resource string) (string, string, error) {
+func (o *OAuthServer) mintTokenPair(r *http.Request, familyID, clientID, userID, scope, resource string, issueRefresh bool) (string, string, error) {
 	accessTok, err := RandomToken(32)
 	if err != nil {
 		return "", "", err
 	}
-	refreshTok, err := RandomToken(32)
-	if err != nil {
-		return "", "", err
-	}
 	now := time.Now().UTC()
-	refExp := now.Add(RefreshTokenTTL)
+	var refreshTok string
+	var refreshHash []byte
+	var refExp *time.Time
+	if issueRefresh {
+		refreshTok, err = RandomToken(32)
+		if err != nil {
+			return "", "", err
+		}
+		refreshHash = SHA256Bytes(refreshTok)
+		exp := now.Add(RefreshTokenTTL)
+		refExp = &exp
+	}
 	err = o.store.CreateOAuthToken(r.Context(), store.OAuthToken{
 		FamilyID:         familyID,
 		TokenHash:        SHA256Bytes(accessTok),
-		RefreshTokenHash: SHA256Bytes(refreshTok),
+		RefreshTokenHash: refreshHash,
 		ClientID:         clientID,
 		UserID:           userID,
 		Scope:            scope,
 		Resource:         resource,
 		AccessExpiresAt:  now.Add(AccessTokenTTL),
-		RefreshExpiresAt: &refExp,
+		RefreshExpiresAt: refExp,
 	})
 	return accessTok, refreshTok, err
 }
@@ -703,7 +734,7 @@ func (o *OAuthServer) CanonicalizeResource(raw string) (string, error) {
 
 func ValidateRedirectURI(raw string) error {
 	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || strings.ContainsRune(trimmed, '\\') {
+	if trimmed == "" || strings.ContainsRune(trimmed, '\\') || strings.ContainsRune(trimmed, '#') {
 		return errors.New("invalid redirect_uri")
 	}
 	for _, r := range trimmed {
@@ -714,6 +745,14 @@ func ValidateRedirectURI(raw string) error {
 	u, err := url.Parse(trimmed)
 	if err != nil || u.Scheme == "" || u.Host == "" || u.Fragment != "" || u.User != nil {
 		return errors.New("redirect_uri must be an absolute URI without fragment or userinfo")
+	}
+	if port := u.Port(); port != "" {
+		p, perr := strconv.Atoi(port)
+		if perr != nil || p < 1 || p > 65535 {
+			return errors.New("redirect_uri has invalid port")
+		}
+	} else if strings.HasSuffix(u.Host, ":") {
+		return errors.New("redirect_uri has empty port")
 	}
 	scheme := strings.ToLower(u.Scheme)
 	host := strings.ToLower(u.Hostname())
@@ -739,6 +778,12 @@ func MatchRegisteredRedirectURI(registered []string, candidate string) bool {
 	if err != nil {
 		return false
 	}
+	normPath := func(p string) string {
+		if p == "" {
+			return "/"
+		}
+		return p
+	}
 	for _, reg := range registered {
 		if reg == candidate {
 			return true
@@ -751,7 +796,7 @@ func MatchRegisteredRedirectURI(registered []string, candidate string) bool {
 			strings.ToLower(candURL.Scheme) == "http" &&
 			isLoopbackRedirectHost(strings.ToLower(regURL.Hostname())) &&
 			strings.EqualFold(regURL.Hostname(), candURL.Hostname()) &&
-			regURL.Path == candURL.Path &&
+			normPath(regURL.Path) == normPath(candURL.Path) &&
 			regURL.RawQuery == candURL.RawQuery {
 			return true
 		}
