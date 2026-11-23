@@ -126,7 +126,7 @@ func run(logger *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("resolve admin bind address: %w", err)
 		}
-		adminSrv := adminapi.New(pgStore, cfg.AdminAPIToken, cfg.AdminBindCIDR)
+		adminSrv := adminapi.New(pgStore, cfg.AdminAPIToken, cfg.AdminAllowCIDR, cfg.PublicBaseURL)
 		adminHTTP = &http.Server{
 			Addr:              adminAddr,
 			Handler:           adminSrv.Handler(),

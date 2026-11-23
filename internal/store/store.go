@@ -160,6 +160,26 @@ type ListArtifactsFilter struct {
 	Offset      int
 }
 
+type AdminArtifactSummary struct {
+	Artifact
+	OwnerUsername string `json:"owner_username"`
+}
+
+type AdminArtifactListFilter struct {
+	Owner       string
+	Visibility  string
+	ContentType string
+	Query       string
+	Limit       int
+	Offset      int
+}
+
+type AdminArtifactListResult struct {
+	Items      []AdminArtifactSummary `json:"artifacts"`
+	TotalCount int                    `json:"total_count"`
+	TotalBytes int64                  `json:"total_bytes"`
+}
+
 type UploadToken struct {
 	TokenHash           []byte
 	ArtifactID          string
@@ -205,6 +225,8 @@ type Store interface {
 	GetArtifactBlob(ctx context.Context, id string) ([]byte, error)
 	ListArtifactsForOwner(ctx context.Context, ownerID string, filter ListArtifactsFilter) ([]Artifact, error)
 	DeleteArtifactForOwner(ctx context.Context, id, ownerID string) error
+	ListAllArtifactsAdmin(ctx context.Context, filter AdminArtifactListFilter) (AdminArtifactListResult, error)
+	DeleteArtifactByIDAdmin(ctx context.Context, id string) error
 
 	CreateUploadTicket(ctx context.Context, ownerID, targetID, newID, title, contentType, visibility string, tokenHash []byte, maxBytes int64, expiresAt time.Time, maxCount int) (Artifact, error)
 	PeekUploadToken(ctx context.Context, tokenHash []byte) (UploadToken, error)
@@ -842,8 +864,8 @@ func (s *PGStore) ListArtifactsForOwner(ctx context.Context, ownerID string, f L
 		conds = append(conds, fmt.Sprintf("content_type = $%d", len(args)))
 	}
 	if q := strings.TrimSpace(f.Query); q != "" {
-		args = append(args, "%"+q+"%")
-		conds = append(conds, fmt.Sprintf("title ILIKE $%d", len(args)))
+		args = append(args, "%"+escapeILIKE(q)+"%")
+		conds = append(conds, fmt.Sprintf("title ILIKE $%d ESCAPE '\\'", len(args)))
 	}
 	args = append(args, limit, offset)
 
@@ -884,6 +906,103 @@ func (s *PGStore) DeleteArtifactForOwner(ctx context.Context, id, ownerID string
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *PGStore) ListAllArtifactsAdmin(ctx context.Context, f AdminArtifactListFilter) (AdminArtifactListResult, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := max(f.Offset, 0)
+
+	args := make([]any, 0, 6)
+	conds := []string{"a.status = 'ready'"}
+	if owner := strings.TrimSpace(f.Owner); owner != "" {
+		if _, err := uuid.Parse(owner); err == nil {
+			args = append(args, owner)
+			conds = append(conds, fmt.Sprintf("a.owner_id = $%d::uuid", len(args)))
+		} else {
+			args = append(args, strings.ToLower(owner))
+			conds = append(conds, fmt.Sprintf("u.username = $%d", len(args)))
+		}
+	}
+	if f.Visibility != "" {
+		args = append(args, f.Visibility)
+		conds = append(conds, fmt.Sprintf("a.visibility = $%d", len(args)))
+	}
+	if f.ContentType != "" {
+		args = append(args, f.ContentType)
+		conds = append(conds, fmt.Sprintf("a.content_type = $%d", len(args)))
+	}
+	if q := strings.TrimSpace(f.Query); q != "" {
+		args = append(args, "%"+escapeILIKE(q)+"%")
+		conds = append(conds, fmt.Sprintf("a.title ILIKE $%d ESCAPE '\\'", len(args)))
+	}
+
+	whereClause := strings.Join(conds, " AND ")
+	var res AdminArtifactListResult
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*)::int, COALESCE(SUM(a.size_bytes), 0)::bigint
+		FROM artifacts a
+		JOIN users u ON u.id = a.owner_id
+		WHERE %s
+	`, whereClause)
+	if err := s.pool.QueryRow(ctx, countQuery, args...).Scan(&res.TotalCount, &res.TotalBytes); err != nil {
+		return AdminArtifactListResult{}, err
+	}
+
+	argsWithPage := append(append([]any(nil), args...), limit, offset)
+	listQuery := fmt.Sprintf(`
+		SELECT a.id, a.owner_id::text, u.username, a.title, a.content_type, a.visibility,
+		       a.version, a.size_bytes, a.sha256, a.status, a.created_at, a.updated_at
+		FROM artifacts a
+		JOIN users u ON u.id = a.owner_id
+		WHERE %s
+		ORDER BY a.updated_at DESC
+		LIMIT $%d OFFSET $%d
+	`, whereClause, len(argsWithPage)-1, len(argsWithPage))
+
+	rows, err := s.pool.Query(ctx, listQuery, argsWithPage...)
+	if err != nil {
+		return AdminArtifactListResult{}, err
+	}
+	defer rows.Close()
+
+	items := make([]AdminArtifactSummary, 0)
+	for rows.Next() {
+		var item AdminArtifactSummary
+		if err := rows.Scan(
+			&item.ID, &item.OwnerID, &item.OwnerUsername, &item.Title, &item.ContentType, &item.Visibility,
+			&item.Version, &item.SizeBytes, &item.SHA256, &item.Status, &item.CreatedAt, &item.UpdatedAt,
+		); err != nil {
+			return AdminArtifactListResult{}, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return AdminArtifactListResult{}, err
+	}
+	res.Items = items
+	return res, nil
+}
+
+func (s *PGStore) DeleteArtifactByIDAdmin(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM artifacts WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func escapeILIKE(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 func (s *PGStore) CreateUploadTicket(ctx context.Context, ownerID, targetID, newID, title, contentType, visibility string, tokenHash []byte, maxBytes int64, expiresAt time.Time, maxCount int) (Artifact, error) {

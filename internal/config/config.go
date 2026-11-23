@@ -23,6 +23,7 @@ type Config struct {
 	ListenAddr             string
 	AdminPort              int
 	AdminBindCIDR          *netip.Prefix
+	AdminAllowCIDR         *netip.Prefix
 	AdminAPIToken          string
 	PublicBaseURL          string
 	PublicIsHTTPS          bool
@@ -85,8 +86,26 @@ func Load(getenv func(string) string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("invalid ADMIN_BIND_CIDR %q: %w", rawCIDR, err)
 		}
+		if pfx.Bits() == 0 {
+			return Config{}, fmt.Errorf("ADMIN_BIND_CIDR %q must not be a catch-all /0 prefix", rawCIDR)
+		}
 		pfx = pfx.Masked()
 		cfg.AdminBindCIDR = &pfx
+	}
+
+	if rawAllow := strings.TrimSpace(getenv("ADMIN_ALLOW_CIDR")); rawAllow != "" {
+		pfx, err := netip.ParsePrefix(rawAllow)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid ADMIN_ALLOW_CIDR %q: %w", rawAllow, err)
+		}
+		if pfx.Bits() == 0 {
+			return Config{}, fmt.Errorf("ADMIN_ALLOW_CIDR %q must not be a catch-all /0 prefix", rawAllow)
+		}
+		pfx = pfx.Masked()
+		cfg.AdminAllowCIDR = &pfx
+	} else if cfg.AdminBindCIDR != nil {
+		pfx := *cfg.AdminBindCIDR
+		cfg.AdminAllowCIDR = &pfx
 	}
 
 	if cfg.AdminAPIToken != "" {

@@ -146,3 +146,86 @@ func TestAdminAPIUsersAndSettings(t *testing.T) {
 		t.Fatalf("unexpected updated settings: %+v", updated)
 	}
 }
+
+func TestAdminAPIArtifactsAndStrictAllowCIDR(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemoryStore()
+
+	alice, err := st.CreateUser(ctx, "alice", "hash", store.RoleAdmin, store.UserStatusActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := st.CreateUser(ctx, "bob", "hash", store.RoleUser, store.UserStatusActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateArtifactWithBlob(ctx, store.Artifact{
+		ID: "art-1", OwnerID: alice.ID, Title: "Alice Report", ContentType: "text/html", Visibility: "private", SHA256: "aaa",
+	}, []byte("<h1>a</h1>"), 10<<20, 100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateArtifactWithBlob(ctx, store.Artifact{
+		ID: "art-2", OwnerID: bob.ID, Title: "Bob Slide", ContentType: "application/pdf", Visibility: "public", SHA256: "bbb",
+	}, []byte("%PDF-1.7\n"), 10<<20, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	pinnedAdmin := netip.MustParsePrefix("172.31.0.2/32")
+	srv := New(st, "admin-secret-token-123456", &pinnedAdmin, "https://artifact.cubus.sh")
+	h := srv.Handler()
+
+	// Sibling container on 172.31.0.130 MUST be rejected (403) even with valid token.
+	sibReq := httptest.NewRequest(http.MethodGet, "/admin/v1/artifacts", nil)
+	sibReq.RemoteAddr = "172.31.0.130:54321"
+	sibReq.Header.Set("Authorization", "Bearer admin-secret-token-123456")
+	sibRec := httptest.NewRecorder()
+	h.ServeHTTP(sibRec, sibReq)
+	if sibRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for sibling IP 172.31.0.130, got %d", sibRec.Code)
+	}
+
+	do := func(method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		req.RemoteAddr = "172.31.0.2:41234"
+		req.Header.Set("Authorization", "Bearer admin-secret-token-123456")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Manifest includes artifacts capability and settings_schema.
+	manRec := do(http.MethodGet, "/admin/v1/manifest")
+	if manRec.Code != http.StatusOK || !bytes.Contains(manRec.Body.Bytes(), []byte("settings_schema")) {
+		t.Fatalf("unexpected manifest: %d %s", manRec.Code, manRec.Body.String())
+	}
+
+	// List all artifacts filtered by owner username.
+	listRec := do(http.MethodGet, "/admin/v1/artifacts?owner=bob&visibility=public")
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list artifacts failed: %d %s", listRec.Code, listRec.Body.String())
+	}
+	var listResp struct {
+		Artifacts  []map[string]any `json:"artifacts"`
+		TotalCount int              `json:"total_count"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listResp); err != nil {
+		t.Fatal(err)
+	}
+	if listResp.TotalCount != 1 || len(listResp.Artifacts) != 1 || listResp.Artifacts[0]["owner_username"] != "bob" ||
+		listResp.Artifacts[0]["viewer_url"] != "https://artifact.cubus.sh/v/art-2" {
+		t.Fatalf("unexpected filtered artifacts: %+v", listResp)
+	}
+
+	// Invalid pagination bounds -> 400.
+	if badRec := do(http.MethodGet, "/admin/v1/artifacts?limit=500"); badRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for limit=500, got %d", badRec.Code)
+	}
+
+	// Delete artifact by ID -> 200, second delete -> 404.
+	if delRec := do(http.MethodDelete, "/admin/v1/artifacts/art-2"); delRec.Code != http.StatusOK {
+		t.Fatalf("delete artifact failed: %d %s", delRec.Code, delRec.Body.String())
+	}
+	if delRec2 := do(http.MethodDelete, "/admin/v1/artifacts/art-2"); delRec2.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on second delete, got %d", delRec2.Code)
+	}
+}

@@ -43,7 +43,8 @@ Additional runtime variables injected by `docker-compose.yml` (standalone) or ro
 
 - `DB_BROKER_URL` (production via `cubus.sh`) or `DATABASE_URL` (standalone dev) — `DB_BROKER_URL` takes precedence.
 - `PUBLIC_BASE_URL` — canonical origin (e.g. `https://artifact.cubus.sh`; `http://` is permitted only for loopback hosts).
-- `ADMIN_BIND_CIDR` — optional CIDR (`172.31.0.0/24` in `cubus.sh`) restricting the `:9090` bind IP and accepted client peers.
+- `ADMIN_BIND_CIDR` — optional CIDR (`172.31.0.0/24` in `cubus.sh`) selecting the interface IP that `:9090` binds to.
+- `ADMIN_ALLOW_CIDR` — optional peer allowlist CIDR (`172.31.0.2/32` in `cubus.sh`) restricting which source IP(s) can call `:9090` (defaults to `ADMIN_BIND_CIDR` when unset).
 - `LISTEN_ADDR` — default `:8000`.
 - `ADMIN_PORT` — default `9090`.
 

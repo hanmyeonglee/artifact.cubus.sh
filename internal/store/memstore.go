@@ -588,6 +588,80 @@ func (m *MemoryStore) DeleteArtifactForOwner(_ context.Context, id, ownerID stri
 	return nil
 }
 
+func (m *MemoryStore) ListAllArtifactsAdmin(_ context.Context, f AdminArtifactListFilter) (AdminArtifactListResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ownerFilter := strings.ToLower(strings.TrimSpace(f.Owner))
+	q := strings.ToLower(strings.TrimSpace(f.Query))
+	matched := make([]AdminArtifactSummary, 0)
+	var totalBytes int64
+	for _, a := range m.artifacts {
+		if a.Status != artifact.StatusReady {
+			continue
+		}
+		ownerName := ""
+		if u, ok := m.users[a.OwnerID]; ok {
+			ownerName = u.Username
+		}
+		if ownerFilter != "" && strings.ToLower(a.OwnerID) != ownerFilter && strings.ToLower(ownerName) != ownerFilter {
+			continue
+		}
+		if f.Visibility != "" && a.Visibility != f.Visibility {
+			continue
+		}
+		if f.ContentType != "" && a.ContentType != f.ContentType {
+			continue
+		}
+		if q != "" && !strings.Contains(strings.ToLower(a.Title), q) {
+			continue
+		}
+		totalBytes += a.SizeBytes
+		matched = append(matched, AdminArtifactSummary{
+			Artifact:      a,
+			OwnerUsername: ownerName,
+		})
+	}
+	sort.Slice(matched, func(i, j int) bool { return matched[i].UpdatedAt.After(matched[j].UpdatedAt) })
+
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := max(f.Offset, 0)
+	var paged []AdminArtifactSummary
+	if offset < len(matched) {
+		end := min(offset+limit, len(matched))
+		paged = matched[offset:end]
+	} else {
+		paged = []AdminArtifactSummary{}
+	}
+	return AdminArtifactListResult{
+		Items:      paged,
+		TotalCount: len(matched),
+		TotalBytes: totalBytes,
+	}, nil
+}
+
+func (m *MemoryStore) DeleteArtifactByIDAdmin(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.artifacts[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.artifacts, id)
+	delete(m.blobs, id)
+	for k, ut := range m.uploadTokens {
+		if ut.ArtifactID == id {
+			delete(m.uploadTokens, k)
+		}
+	}
+	return nil
+}
+
 func (m *MemoryStore) CreateUploadTicket(_ context.Context, ownerID, targetID, newID, title, contentType, visibility string, tokenHash []byte, maxBytes int64, expiresAt time.Time, maxCount int) (Artifact, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

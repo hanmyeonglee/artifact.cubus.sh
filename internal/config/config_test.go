@@ -98,6 +98,14 @@ func TestLoadRejectsPlaceholdersAndMissingDB(t *testing.T) {
 				"BOOTSTRAP_ADMIN_PASSWORD": "replace-with-a-strong-admin-password",
 			},
 		},
+		{
+			name: "catch-all admin allow cidr",
+			env: map[string]string{
+				"PUBLIC_BASE_URL":  "https://artifact.cubus.sh",
+				"DATABASE_URL":     "postgres://u:p@localhost/db",
+				"ADMIN_ALLOW_CIDR": "0.0.0.0/0",
+			},
+		},
 	}
 
 	for _, tc := range cases {
